@@ -19,9 +19,10 @@ from .database import get_db
 from .errors import AppError
 from .models import User
 
-# Access tokens presented to /auth/logout are recorded here so they can no
-# longer be used.
-_revoked_tokens: set[str] = set()
+# Revoked token JTIs mapped to their expiry timestamp.
+# Entries are pruned once the token's exp has passed — jwt.decode already
+# rejects expired tokens via the exp claim, so keeping them is wasteful.
+_revoked_tokens: dict[str, int] = {}  # jti -> exp unix timestamp
 
 _PBKDF2_ROUNDS = 100_000
 
@@ -82,8 +83,16 @@ def decode_token(token: str) -> dict:
         raise AppError(401, "UNAUTHORIZED", "Invalid or expired token")
 
 
+def _prune_revoked() -> None:
+    """Remove entries for tokens that have already expired."""
+    now = _now_ts()
+    expired = [jti for jti, exp in _revoked_tokens.items() if exp < now]
+    for jti in expired:
+        _revoked_tokens.pop(jti, None)
+
+
 def revoke_access_token(payload: dict) -> None:
-    _revoked_tokens.add(payload["jti"])
+    _revoked_tokens[payload["jti"]] = payload["exp"]
 
 
 def get_token_payload(request: Request) -> dict:
@@ -94,6 +103,7 @@ def get_token_payload(request: Request) -> dict:
     payload = decode_token(token)
     if payload.get("type") != "access":
         raise AppError(401, "UNAUTHORIZED", "Wrong token type")
+    _prune_revoked()
     if payload.get("jti") in _revoked_tokens:
         raise AppError(401, "UNAUTHORIZED", "Token has been revoked")
     return payload

@@ -147,3 +147,34 @@
 **File:** `app/routers/bookings.py`
 **Bug:** The `list_bookings` endpoint unconditionally filtered by `Booking.user_id == user.id`. This meant that even organization admins could only see their own personal bookings, rather than all bookings across the organization, violating Rule 9.
 **Fix:** Added a conditional check. If `user.role == "admin"`, it joins `Room` and filters by `Room.org_id == user.org_id`.
+
+## Bug 31 — Artificial Sleeps Still Active Inside Global Booking Lock (Hard)
+**File:** `app/routers/bookings.py`, lines 30–55
+**Bug:** After the Bug 22/23 fix wrapped conflict and quota checks inside `_booking_lock`, the artificial `time.sleep()` calls inside `_pricing_warmup()` (0.12 s) and `_quota_audit()` (0.1 s) were left in place. Because these helpers are called from within the lock, every booking-creation request holds the global lock for at least 0.22 seconds. With multiple concurrent users this serializes all `POST /bookings` across the entire service, easily causing multi-second stalls and violating Rule 16 ("no combination of concurrent valid requests may hang the service"). The dead `_settlement_pause()` function also remained.
+**Fix:** Removed `_pricing_warmup()`, `_quota_audit()`, and `_settlement_pause()` function definitions entirely, along with their call sites inside `_has_conflict()` and `_check_quota()`. Removed the now-unused `import time`.
+
+## Bug 32 — Start Time Check Uses `>=` Instead of `>` (Easy)
+**File:** `app/routers/bookings.py`, line 89
+**Bug:** The guard `if start >= now` allowed a booking with `start_time == now` to pass validation. The spec (Rule 2) states start_time must be **strictly** in the future with no grace window of any size. A booking with `start == now` is instantaneously in the past once stored.
+**Fix:** Changed condition to `if start <= now: raise AppError(...)`, effectively requiring `start > now`.
+
+## Bug 33 — Revoked Token Set Grows Without Bound (Hard)
+**File:** `app/auth.py`, line 24
+**Bug:** `_revoked_tokens` was a plain `set[str]` that entries were only ever added to (on logout and refresh). Tokens expire after 15 minutes (access) or 7 days (refresh), but their JTIs stayed in the set forever. Under sustained use the set grows without limit, eventually exhausting memory and crashing the process — a violation of Rule 16 (liveness).
+**Fix:** Changed `_revoked_tokens` to `dict[str, int]` mapping `jti → exp_timestamp`. Added `_prune_revoked()` which removes entries whose `exp` has already passed. `_prune_revoked()` is called at the start of `get_token_payload()` so the set is periodically trimmed on every authenticated request. `revoke_access_token()` now stores `payload["jti"] → payload["exp"]` instead of using `.add()`.
+
+## Bug 34 — Cache Module Has No Thread Safety (Hard)
+**File:** `app/cache.py`
+**Bug:** `_report_cache` and `_availability_cache` were plain dicts mutated directly from request-handling threads without any lock. The `invalidate_report()` function built a snapshot of keys and then popped them in two separate steps; a concurrent `set_report()` call between those steps could insert a new stale entry that was never evicted, causing the cache to serve outdated report data indefinitely. Similar races existed in `set_availability` / `get_availability`.
+**Fix:** Added `_cache_lock = threading.Lock()` and wrapped all reads and writes in every cache function with `with _cache_lock:`, making all mutations atomic.
+
+## Bug 35 — Usage Report Accepts Inverted Date Range Silently (Medium)
+**File:** `app/routers/admin.py`, lines 29–36
+**Bug:** When `from > to` was supplied (e.g. `?from=2025-12-31&to=2025-01-01`), the computed `range_end` was earlier than `range_start`. The DB query returned zero bookings for every room and the endpoint responded with HTTP 200 and an empty-looking (but structurally valid) report — silently misleading the caller.
+**Fix:** Added an explicit check `if from_date > to_date: raise AppError(400, "INVALID_BOOKING_WINDOW", "from date must not be after to date")` immediately after parsing the dates.
+
+## Bug 36 — Database Session Missing Rollback on Exception (Medium)
+**File:** `app/database.py`, lines 17–23
+**Bug:** The `get_db()` dependency only had a `finally: db.close()` block. If an unhandled exception propagated out of a route after a `db.flush()` but before `db.commit()` (e.g. an unexpected `IntegrityError`), the session was closed without an explicit rollback. While SQLAlchemy usually rolls back implicitly on close, a session in a broken transaction state can return its underlying connection to the pool in an unusable state, causing subsequent requests to fail or behave incorrectly.
+**Fix:** Added `except Exception: db.rollback(); raise` before the `finally` block, ensuring the session is always cleanly rolled back before being closed.
+
