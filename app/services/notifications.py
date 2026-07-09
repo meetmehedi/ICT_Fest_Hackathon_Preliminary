@@ -22,14 +22,16 @@ def _write_audit(kind: str, booking) -> None:
 
 
 def notify_created(booking) -> None:
+    # Always acquire locks in the same order (email → audit) to prevent deadlock.
     with _email_lock:
         _send_email("created", booking)
-        with _audit_lock:
-            _write_audit("created", booking)
+    with _audit_lock:
+        _write_audit("created", booking)
 
 
 def notify_cancelled(booking) -> None:
+    # Always acquire locks in the same order (email → audit) to prevent deadlock.
+    with _email_lock:
+        _send_email("cancelled", booking)
     with _audit_lock:
         _write_audit("cancelled", booking)
-        with _email_lock:
-            _send_email("cancelled", booking)
