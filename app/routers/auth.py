@@ -24,10 +24,16 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     org = db.query(Organization).filter(Organization.name == payload.org_name).first()
     role = "admin" if org is None else "member"
     if org is None:
-        org = Organization(name=payload.org_name)
-        db.add(org)
-        db.commit()
-        db.refresh(org)
+        from sqlalchemy.exc import IntegrityError
+        try:
+            org = Organization(name=payload.org_name)
+            db.add(org)
+            db.commit()
+            db.refresh(org)
+        except IntegrityError:
+            db.rollback()
+            org = db.query(Organization).filter(Organization.name == payload.org_name).first()
+            role = "member"
 
     existing = (
         db.query(User)

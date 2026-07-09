@@ -9,7 +9,7 @@
 **Fix:** Changed to check `payload.get("jti")`.
 
 ## Bug 3 — Registration Does Not Return 409 for Duplicate Username (Easy)
-**File:** `app/routers/auth.py`, line 37
+**File:** `app/routers/auth.py`, line 37 
 **Bug:** When registering a duplicate username, the endpoint just returned HTTP 200 OK with the existing user's details, instead of raising `409 USERNAME_TAKEN`.
 **Fix:** Raised `AppError(409, "USERNAME_TAKEN", ...)` if `existing is not None`.
 
@@ -187,3 +187,43 @@
 **File:** `app/routers/bookings.py`, lines 108–109
 **Bug:** The `_check_quota()` function was called unconditionally for all users, including admins. The 3-booking-per-24h rolling window quota is a member-only constraint (Rule 4 defines it for members). Admins performing operational bookings on behalf of the organisation were blocked by this limit.
 **Fix:** Added a role guard `if user.role != "admin": _check_quota(...)` so the quota check is only executed for member-role users. Admins bypass it entirely.
+
+## Bug 39 — `_pricing_warmup()` sleep inside SQLite write lock (Critical, Rule 16)
+**File:** `app/routers/bookings.py`, `_has_conflict()`
+**Bug:** `_pricing_warmup()` called `time.sleep(0.12)` inside `_has_conflict()`, which executes within a `BEGIN IMMEDIATE` transaction holding the SQLite exclusive write lock. Every booking creation blocked ALL other write operations for 120ms — a direct liveness violation under Rule 16.
+**Fix:** Removed the artificial `_pricing_warmup()` call.
+
+## Bug 40 — `_quota_audit()` sleep inside SQLite write lock (Critical, Rule 16)
+**File:** `app/routers/bookings.py`, `_check_quota()`
+**Bug:** `_quota_audit()` called `time.sleep(0.1)` inside `_check_quota()`, also within the `BEGIN IMMEDIATE` write lock. Combined with Bug 39, every member booking held the exclusive DB lock for 220ms+.
+**Fix:** Removed the artificial `_quota_audit()` call.
+
+## Bug 41 — `_aggregate_pause()` sleep inside `_stats_lock` (Critical, Rule 16)
+**File:** `app/services/stats.py`, `record_create()` and `record_cancel()`
+**Bug:** `_aggregate_pause()` called `time.sleep(0.1)` while holding `_stats_lock`. Since every booking create/cancel calls `record_create`/`record_cancel`, and `get()` (stats endpoint) also acquires the same lock, all stats operations serialized behind a 100ms bottleneck.
+**Fix:** Removed the artificial `_aggregate_pause()` calls from both functions and replaced the stats service in-memory cache with direct DB query aggregations.
+
+## Bug 42 — `_settle_pause()` sleep inside `_ratelimit_lock` (Critical, Rule 16)
+**File:** `app/services/ratelimit.py`, `record_and_check()`
+**Bug:** `_settle_pause()` called `time.sleep(0.1)` while holding `_ratelimit_lock`. Every booking attempt (regardless of user) waited behind a single 100ms-held global lock, preventing concurrent booking requests from proceeding.
+**Fix:** Removed the artificial `_settle_pause()` call.
+
+## Bug 43 — `_format_pause()` sleep inside `_reference_lock` (Critical, Rule 16)
+**File:** `app/services/reference.py`, `next_reference_code()`
+**Bug:** `_format_pause()` called `time.sleep(0.12)` while holding `_reference_lock`. Reference code generation is on the critical path of every booking creation, serializing all concurrent bookings behind a 120ms lock hold.
+**Fix:** Removed the artificial `_format_pause()` call.
+
+## Bug 44 — Notification sleeps serializing all requests (Medium, Rule 16)
+**File:** `app/services/notifications.py`, `_send_email()` and `_write_audit()`
+**Bug:** `_send_email()` slept 120ms inside `_email_lock` and `_write_audit()` slept 100ms inside `_audit_lock`. Both are called on every booking create/cancel. Two global locks held for a combined 220ms serialized all post-commit processing, even though the DB transaction was already committed.
+**Fix:** Removed the artificial sleeps from both functions.
+
+## Bug 45 — Org registration TOCTOU race causes 500 error (Medium)
+**File:** `app/routers/auth.py`, `register()`
+**Bug:** Two concurrent `POST /auth/register` requests with the same new `org_name` both see `org=None`, both set `role="admin"`, and both attempt to `INSERT` the organization. Since `Organization.name` has `unique=True`, the second insert crashes with an unhandled `IntegrityError` returning an HTTP 500.
+**Fix:** Wrapped the org creation in a `try/except IntegrityError` block. On conflict, the session is rolled back, the existing org is re-queried, and the role is correctly set to `"member"`.
+
+## Bug 46 — `stats.record_cancel` allows negative revenue (Low)
+**File:** `app/services/stats.py`, `record_cancel()`
+**Bug:** `record_cancel` applied `max(0, count - 1)` to prevent negative booking count but used bare `revenue - price_cents` for revenue, which could go negative if stats were initialized at an inconsistent point. Rule 14 says stats must "equal the values derivable from the bookings themselves" — and a negative revenue is never derivable from real data.
+**Fix:** Stats service now queries the DB directly with `COUNT`/`SUM` aggregates, avoiding negative revenue entirely.
