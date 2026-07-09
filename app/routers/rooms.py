@@ -45,6 +45,12 @@ def create_room(
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
+    if payload.capacity <= 0 or payload.hourly_rate_cents < 0:
+        raise AppError(400, "INVALID_ROOM", "Capacity must be > 0 and hourly rate >= 0")
+    
+    existing = db.query(Room).filter(Room.org_id == admin.org_id, Room.name == payload.name).first()
+    if existing is not None:
+        raise AppError(409, "ROOM_NAME_TAKEN", "Room name must be unique")
     room = Room(
         org_id=admin.org_id,
         name=payload.name,
@@ -54,6 +60,9 @@ def create_room(
     db.add(room)
     db.commit()
     db.refresh(room)
+    
+    cache.invalidate_report(admin.org_id)
+    
     return _serialize_room(room)
 
 
@@ -107,7 +116,7 @@ def room_stats(
     user: User = Depends(get_current_user),
 ):
     room = _get_org_room(db, room_id, user.org_id)
-    current = stats.get(room.id)
+    current = stats.get(room.id, db)
     return {
         "room_id": room.id,
         "total_confirmed_bookings": current["count"],
