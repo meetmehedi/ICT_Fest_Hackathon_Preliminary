@@ -91,7 +91,9 @@ def create_booking(
         if _has_conflict(db, room.id, start, end):
             raise AppError(409, "ROOM_CONFLICT", "Room already booked for this interval")
 
-        _check_quota(db, user.id, now, start)
+        # Admins are not subject to the 3-booking/24h rolling quota.
+        if user.role != "admin":
+            _check_quota(db, user.id, now, start)
 
         price_cents = room.hourly_rate_cents * duration_hours
         booking = Booking(

@@ -20,7 +20,7 @@
 
 ## Bug 5 — Datetime Timezone Conversion Strips Offset (Medium)
 **File:** `app/timeutils.py`, line 13
-**Bug:** `parse_input_datetime` stripped the `tzinfo` from aware datetimes without first converting them to UTC. This effectively changed the absolute time to whatever the local time string was.
+**Bug:** `parse_input_datetime` stripped the `tzinfo` from aware datetimes without first converting them to UTC. This effectively changed the absolute time to whatever the local time string was (e.g., `10:00:00+06:00` became `10:00:00` naive UTC instead of `04:00:00`).
 **Fix:** Added `.astimezone(timezone.utc)` before dropping the `tzinfo`.
 
 ## Bug 6 — Start Time Allows 5-Minute Grace Window in the Past (Easy)
@@ -80,8 +80,8 @@
 
 ## Bug 17 — Room Stats Use Inconsistent In-Memory Cache (Hard)
 **File:** `app/services/stats.py`
-**Bug:** In-memory read-modify-write with `time.sleep(0.1)` between read and write guaranteed stale/wrong stats under concurrent bookings/cancellations.
-**Fix:** Removed in-memory cache. `stats.get()` now queries DB directly with `COUNT`/`SUM` aggregates for always-consistent results.
+**Bug:** In-memory read-modify-write with `time.sleep(0.1)` between read and write guaranteed stale/wrong stats under concurrent bookings/cancellations. Additionally, on application reboot, lazy-loaded in-memory entries defaulted to `{"count": 0, "revenue": 0}` regardless of existing DB records, causing stats to show zero after cold boot.
+**Fix:** Removed in-memory cache entirely. `stats.get()` now queries DB directly with `COUNT`/`SUM` aggregates for always-consistent results that survive restarts.
 
 ## Additional Fix — Cache Invalidation Gaps
 **Files:** `app/routers/bookings.py`
@@ -178,3 +178,12 @@
 **Bug:** The `get_db()` dependency only had a `finally: db.close()` block. If an unhandled exception propagated out of a route after a `db.flush()` but before `db.commit()` (e.g. an unexpected `IntegrityError`), the session was closed without an explicit rollback. While SQLAlchemy usually rolls back implicitly on close, a session in a broken transaction state can return its underlying connection to the pool in an unusable state, causing subsequent requests to fail or behave incorrectly.
 **Fix:** Added `except Exception: db.rollback(); raise` before the `finally` block, ensuring the session is always cleanly rolled back before being closed.
 
+## Bug 37 — `Z` Suffix Not Supported in Python 3.9 `fromisoformat()` (Medium)
+**File:** `app/timeutils.py`, line 11
+**Bug:** Python 3.9's `datetime.fromisoformat()` does not accept the trailing `Z` UTC designator (e.g. `"2025-07-09T10:00:00Z"` raises `ValueError`). Any client sending ISO 8601 datetimes with `Z` as the UTC marker would receive a 500 Internal Server Error instead of processing the booking correctly. Python 3.11 added `Z` support, but the base image may run 3.9.
+**Fix:** Added `.replace("Z", "+00:00")` before parsing: `datetime.fromisoformat(value.replace("Z", "+00:00"))`. This normalises `Z` to the explicit `+00:00` offset, which is accepted by all Python versions.
+
+## Bug 38 — Booking Quota Incorrectly Applied to Admins (Medium)
+**File:** `app/routers/bookings.py`, lines 108–109
+**Bug:** The `_check_quota()` function was called unconditionally for all users, including admins. The 3-booking-per-24h rolling window quota is a member-only constraint (Rule 4 defines it for members). Admins performing operational bookings on behalf of the organisation were blocked by this limit.
+**Fix:** Added a role guard `if user.role != "admin": _check_quota(...)` so the quota check is only executed for member-role users. Admins bypass it entirely.
